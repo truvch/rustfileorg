@@ -1,0 +1,9 @@
+[package]
+name = "smart-file-organizer"
+version = "0.1.0"
+edition = "2021"
+description = "Smart File Organizer — a file management system simulation for Linux"
+
+[dependencies]
+notify = "6"
+directories = "5"
