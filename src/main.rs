@@ -4,65 +4,88 @@ mod rule_sorter;
 mod date_sorter;
 mod file_ops;
 
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use directories::UserDirs;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{Event, EventKind};
 
-/// Sorting strategy for organizing files.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SortMode {
     Rule,
     Date,
 }
 
+const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
 fn main() {
     let mode = parse_args();
     let downloads = resolve_downloads_dir();
     let (tx, rx) = mpsc::channel::<Result<Event, notify::Error>>();
 
-    let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
-    })
-    .expect("Failed to create filesystem watcher");
-
-    watcher
-        .watch(&downloads, RecursiveMode::NonRecursive)
-        .expect("Failed to start watching the downloads directory");
+    let _watcher =
+        monitor::start_watcher(&downloads, tx).expect("Failed to start filesystem watcher");
 
     println!("=== Smart File Organizer ===");
     println!("Mode:      {:?}", mode);
     println!("Watching:  {}", downloads.display());
     println!("Press Ctrl+C to stop.\n");
 
+    let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
+
     loop {
-        match rx.recv() {
+        match rx.recv_timeout(POLL_INTERVAL) {
             Ok(Ok(event)) => {
-                if !matches_event_kind(&event.kind) {
-                    continue;
-                }
-                for path in event.paths {
+                let now = Instant::now();
+
+                for path in &event.paths {
                     if !path.is_file() {
                         continue;
                     }
-                    thread::sleep(Duration::from_millis(100));
 
-                    if !path.exists() || !path.is_file() {
-                        continue;
+                    let is_close_write = matches!(
+                        event.kind,
+                        EventKind::Access(AccessKind::Close(AccessMode::Write))
+                    );
+
+                    if is_close_write {
+                        pending.remove(path);
+                        if path.exists() {
+                            handle_new_file(&downloads, path, mode);
+                        }
+                    } else if matches!(
+                        event.kind,
+                        EventKind::Create(_) | EventKind::Modify(_)
+                    ) {
+                        pending.insert(path.clone(), now);
                     }
-
-                    handle_new_file(&downloads, &path, mode);
                 }
             }
             Ok(Err(e)) => {
                 eprintln!("Watch error: {e}");
             }
-            Err(_) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let cutoff = Instant::now()
+                    .checked_sub(DEBOUNCE_DURATION)
+                    .unwrap_or(Instant::now());
+                pending.retain(|path, last_seen| {
+                    if *last_seen <= cutoff {
+                        if path.exists() {
+                            handle_new_file(&downloads, path, mode);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 println!("\nShutting down.");
                 break;
             }
@@ -70,7 +93,6 @@ fn main() {
     }
 }
 
-/// Parses `--mode rule` or `--mode date` from CLI args. Defaults to `Rule`.
 fn parse_args() -> SortMode {
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
@@ -86,7 +108,6 @@ fn parse_args() -> SortMode {
     SortMode::Rule
 }
 
-/// Resolves the user's Downloads directory following XDG conventions.
 fn resolve_downloads_dir() -> PathBuf {
     UserDirs::new()
         .and_then(|u| u.download_dir().map(Path::to_path_buf))
@@ -100,7 +121,6 @@ fn resolve_downloads_dir() -> PathBuf {
         })
 }
 
-/// Fallback when XDG user dirs are unavailable.
 fn dirs_fallback_download() -> PathBuf {
     if let Ok(home) = env::var("HOME") {
         PathBuf::from(home).join("Downloads")
@@ -110,15 +130,6 @@ fn dirs_fallback_download() -> PathBuf {
     }
 }
 
-/// Returns `true` for event kinds that indicate a new or modified file.
-fn matches_event_kind(kind: &EventKind) -> bool {
-    matches!(
-        kind,
-        EventKind::Create(_) | EventKind::Modify(_)
-    )
-}
-
-/// Routes a newly detected file through the full organisation pipeline.
 fn handle_new_file(base_dir: &Path, file_path: &Path, mode: SortMode) {
     let meta = match metadata::read_metadata(file_path) {
         Some(m) => m,
